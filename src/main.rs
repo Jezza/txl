@@ -123,7 +123,7 @@ fn main() {
 		};
 
 		let output = tmux.new_session(&new_session).unwrap();
-		println!("Creating session: {}", output);
+		println!("new-session: {:?}", output);
 	}
 
 	// We rename the first window, so we can locate and remove it later.
@@ -147,7 +147,7 @@ fn main() {
 				..Default::default()
 			};
 			let output = tmux.new_window(new_window).unwrap();
-			println!("Creating window: {}", output);
+			println!("new-window: {:?}", output);
 		}
 
 		for action in parse_layout(&layout) {
@@ -167,7 +167,7 @@ fn main() {
 			};
 
 			let output = tmux.split_window(&split_window).unwrap();
-			println!("{}", output);
+			println!("split-window: {:?}", output);
 		}
 
 		for _pane in panes {
