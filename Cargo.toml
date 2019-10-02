@@ -1,0 +1,17 @@
+[package]
+name = "txl"
+version = "0.1.0"
+authors = ["Jezza <jeremy.barrow@vhbw.de>"]
+edition = "2018"
+
+[dependencies]
+toml = "*"
+exec = "0.3.1"
+
+[dependencies.tmux_interface]
+#version = "0.0.5"
+path = "../tmux-interface-rs"
+
+[dependencies.serde]
+version = "*"
+features = ["derive"]
