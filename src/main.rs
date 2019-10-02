@@ -172,6 +172,9 @@ fn main() {
 
 		for _pane in panes {
 			// Select pane, then send-keys.
+
+			// @TODO Jezza - 03 Oct. 2019: Finish this on Friday,
+			// when I have energy, and a linux system to test it on.
 		}
 	}
 
