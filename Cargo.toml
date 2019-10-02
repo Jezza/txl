@@ -5,7 +5,10 @@ authors = ["Jezza <jeremy.barrow@vhbw.de>"]
 edition = "2018"
 
 [dependencies]
-toml = "*"
+toml = "0.5.3"
+structopt = "0.3.2"
+
+[target."cfg(unix)".dependencies]
 exec = "0.3.1"
 
 [dependencies.tmux_interface]
@@ -13,5 +16,5 @@ exec = "0.3.1"
 path = "../tmux-interface-rs"
 
 [dependencies.serde]
-version = "*"
+version = "1.0.101"
 features = ["derive"]

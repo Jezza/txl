@@ -1,8 +1,17 @@
 use std::ops::Deref;
+use std::path::PathBuf;
 
 use serde::Deserialize;
-use tmux_interface::NewSession;
-use tmux_interface::TmuxInterface;
+use structopt::StructOpt;
+use tmux_interface::{
+	AttachSession,
+	NewSession,
+	NewWindow,
+	SplitWindow,
+	TmuxInterface
+};
+
+const ORIGINAL_WINDOW_NAME: &str = "__DEFAULT__";
 
 #[derive(Debug, Deserialize)]
 struct Setup {
@@ -13,7 +22,7 @@ struct Setup {
 	windows: Vec<Window>,
 }
 
-#[derive(Default, Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct Session {
 	name: Option<String>,
 }
@@ -21,7 +30,7 @@ struct Session {
 #[derive(Debug, Deserialize)]
 struct Window {
 	name: Option<String>,
-	layout: Option<String>,
+	layout: String,
 	#[serde(rename = "pane")]
 	panes: Option<Vec<Pane>>,
 }
@@ -32,79 +41,65 @@ struct Pane {
 	command: Option<String>,
 }
 
-fn main0() {
-	let layout = r#"
-	0012
-	0034
-	5555
-	"#;
-	let actions = parse_layout(layout);
-	for action in actions {
-		println!("{:?}", action);
-	}
+#[derive(Debug, StructOpt)]
+#[structopt(name = "txl", about = "A tmux layout manager.")]
+struct Args {
+	/// TOML file that contains a txl layout.
+	#[structopt(parse(from_os_str))]
+	file: PathBuf,
 }
 
 fn main() {
-	let input = r##"
-        #file = "/home/amazon/.config/tmux/jezza.conf"
-        socket_name = "jezza"
+	let Args {
+		file,
+	} = <_>::from_args();
 
-        [session]
-        name = "Hello!"
+	let input = {
+		let mut path = file;
 
-        [[window]]
-        name = "My first window!"
-        layout = '''
-        0012
-        0034
-        5555
-        '''
+		macro_rules! not {
+		    ($ext:literal) => {{
+		    	path.set_extension($ext);
+		    	!path.exists()
+		    }};
+		}
 
-        [[window.pane]]
-        command = '''
-        echo "Number 1!"
-        echo "Thing?"
-        '''
+		if !path.exists() && not!("txl") && not!("toml") {
+			path.set_extension("");
+			eprintln!("Unable to locate file: {}[.txl|.toml]", path.display());
+			return;
+		}
 
-        [[window.pane]]
-        command = '''
-        echo "Number 2!"
-        '''
+		match std::fs::read_to_string(&path) {
+			Ok(value) => value,
+			Err(err) => {
+				eprintln!("Unable to read file: {}\n{}", path.display(), err);
+				return;
+			}
+		}
+	};
 
-        [[window.pane]]
-        command = '''
-        echo "Number 3!"
-        '''
-        [[window.pane]]
-        command = '''
-        echo "Number 4!"
-        '''
-        [[window.pane]]
-        command = '''
-        echo "Number 5!"
-        '''
-        [[window.pane]]
-        command = '''
-        echo "Number 6!"
-        '''
-    "##;
 	let Setup {
 		file,
 		socket_name,
 		session,
 		windows
-	} = toml::from_str(input).unwrap();
+	} = toml::from_str(&input).unwrap();
+
+	let file = file.as_ref().map(Deref::deref);
+	let socket_name = socket_name.as_ref().map(Deref::deref);
 
 	let Session {
 		name: session_name,
 	} = session.unwrap_or_default();
+
 	let session_name = session_name.as_ref().map(Deref::deref);
 
-	println!("{:#?}", windows);
+//	println!("{:#?}", windows);
 
 	let tmux = TmuxInterface {
-		file: file.as_ref().map(Deref::deref),
-		socket_name: socket_name.as_ref().map(Deref::deref),
+		file,
+		socket_name,
 		..Default::default()
 	};
 
@@ -124,7 +119,6 @@ fn main() {
 		let new_session = NewSession {
 			session_name,
 			detached: Some(true),
-			shell_command: Some("bash -l"),
 			..Default::default()
 		};
 
@@ -132,41 +126,42 @@ fn main() {
 		println!("Creating session: {}", output);
 	}
 
-	let output = tmux.rename_window(None, "__DEFAULT__").unwrap();
+	// We rename the first window, so we can locate and remove it later.
+	let output = tmux.rename_window(None, ORIGINAL_WINDOW_NAME).unwrap();
 	println!("Renaming default window: {:?}", output);
 
 	// This is where we need to build the actual layout...
 
-	for window in windows {
-		{
-			// Creating window
-			use tmux_interface::NewWindow;
+	for Window {
+		name: window_name,
+		layout,
+		panes,
+	} in windows {
+		let window_name = window_name.as_ref().map(Deref::deref);
+		let panes = panes.unwrap_or_default();
+
+		{ // Tell tmux to create the window
 			let new_window = NewWindow {
 				detached: Some(false),
-				window_name: window.name.as_ref().map(Deref::deref),
+				window_name,
 				..Default::default()
 			};
 			let output = tmux.new_window(new_window).unwrap();
 			println!("Creating window: {}", output);
 		}
 
-		let layout = window.layout.unwrap();
 		for action in parse_layout(&layout) {
 			println!("{:?}", action);
 
-			let Action {
-				vertical,
-				target,
-				percentage,
-			} = action;
+			let Action(direction, target, percentage) = action;
 
 			let selected = format!("{}", target + 1);
 			let percentage = (percentage * 100f32) as usize;
-			use tmux_interface::SplitWindow;
+
 			let split_window = SplitWindow {
 				target_pane: Some(&selected),
-				vertical: Some(vertical),
-				horizontal: Some(!vertical),
+				vertical: Some(direction == Direction::Vertical),
+				horizontal: Some(direction == Direction::Horizontal),
 				percentage: Some(percentage),
 				..Default::default()
 			};
@@ -174,15 +169,17 @@ fn main() {
 			let output = tmux.split_window(&split_window).unwrap();
 			println!("{}", output);
 		}
+
+		for _pane in panes {
+			// Select pane, then send-keys.
+		}
 	}
 
-	let output = tmux.kill_window(None, Some("__DEFAULT__")).unwrap();
+	// Kill the first window, as tmux just adds it, but we don't want or need it.
+	let output = tmux.kill_window(None, Some(ORIGINAL_WINDOW_NAME)).unwrap();
 	println!("Killing default window: {:?}", output);
 
-
-	{
-		// We're done here, so we can attach to the session, and promptly fuck off.
-		use tmux_interface::AttachSession;
+	{ // We're done here, so we can attach to the session, and promptly fuck off.
 		let attach_session = AttachSession {
 			target_session: session_name,
 			detach_other: Some(true),
@@ -191,41 +188,25 @@ fn main() {
 
 		println!("Attaching to session!");
 		tmux.attach_session_with(&attach_session, |args| {
-			use exec::Command;
 			println!("{:?}", args);
 
-			let mut command = Command::new("tmux");
-			command.args(&args);
-			let error = command.exec();
-			panic!("{}", error);
+//			use exec::Command;
+//			let mut command = Command::new("tmux");
+//			command.args(&args);
+//			let error = command.exec();
+//			panic!("{}", error);
 		});
 	}
 }
 
+#[derive(Debug, PartialEq)]
+enum Direction {
+	Vertical,
+	Horizontal,
+}
+
 #[derive(Debug)]
-struct Action {
-	vertical: bool,
-	target: u8,
-	percentage: f32,
-}
-
-impl Action {
-	fn split_v(target: u8, percentage: f32) -> Self {
-		Action {
-			vertical: true,
-			target,
-			percentage,
-		}
-	}
-
-	fn split_h(target: u8, percentage: f32) -> Self {
-		Action {
-			vertical: false,
-			target,
-			percentage,
-		}
-	}
-}
+struct Action(Direction, u8, f32);
 
 fn parse_layout(layout: &str) -> Vec<Action> {
 	let (width, height, mut rects) = determine_rectangles(layout);
@@ -241,12 +222,12 @@ fn parse_layout(layout: &str) -> Vec<Action> {
 			Ordinal::South => {
 				remaining.height += merging.height;
 				let percentage = merging.height as f32 / height as f32;
-				actions.push(Action::split_v(parent as u8, percentage));
+				actions.push(Action(Direction::Vertical, parent as u8, percentage));
 			}
 			Ordinal::East => {
 				remaining.width += merging.width;
 				let percentage = merging.width as f32 / width as f32;
-				actions.push(Action::split_h(parent as u8, percentage));
+				actions.push(Action(Direction::Horizontal, parent as u8, percentage));
 			}
 			_ => panic!("Someone changed the ORDINALS constant..."),
 		}
@@ -266,9 +247,7 @@ fn find_first_pair(rects: &Vec<Rect>) -> Option<(usize, usize, Ordinal)> {
 	for (left, rect) in rects.iter().enumerate() {
 		for ordinal in ORDINALS {
 			let edge = rect.edge(*ordinal);
-			if let Some((right, value)) = rects.iter()
-				.enumerate()
-				.find(|(i, r)| *r != rect && r.edge(ordinal.opposite()) == edge) {
+			if let Some(right) = rects.iter().position(|r| r != rect && r.edge(ordinal.opposite()) == edge) {
 				return Some((left, right, *ordinal));
 			}
 		}
@@ -348,7 +327,7 @@ struct Edge {
 }
 
 fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
-	let (width, height, chars) = beautify_input(layout);
+	let (width, height, chars) = process_input(layout);
 
 	macro_rules! point {
 	    ($index:ident) => {
@@ -371,7 +350,6 @@ fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
 			continue;
 		}
 		let c = chars[index];
-		let index_point = point!(index);
 
 		let rect_width = {
 			let mut rect_width = width;
@@ -402,7 +380,6 @@ fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
 		for y_offset in 0..rect_height {
 			for x_offset in 0..rect_width {
 				let bit_index = index + x_offset + (y_offset * width);
-
 				if chars[bit_index] != c {
 					panic!("Invalid character at {:?}. [expected: {:?}, found: {:?}]", point!(bit_index), c, chars[bit_index]);
 				}
@@ -410,10 +387,12 @@ fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
 			}
 		}
 
+		let (x, y) = point!(index);
+
 		let rect = Rect {
 			c,
-			x: index_point.0 as u8,
-			y: index_point.1 as u8,
+			x: x as u8,
+			y: y as u8,
 			width: rect_width as u8,
 			height: rect_height as u8,
 		};
@@ -425,19 +404,18 @@ fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
 	(width, height, rects)
 }
 
-fn beautify_input(layout: &str) -> (usize, usize, Vec<char>) {
+fn process_input(layout: &str) -> (usize, usize, Vec<char>) {
 	#[derive(PartialEq)]
 	enum Mode {
-		SkipStartingWhitespace,
 		WidthCounting,
 		HeightCounting,
 		SkipWhitespace,
 	}
 	use Mode::*;
 
-	println!("======");
-	println!("{}", layout);
-	println!("======");
+//	println!("======");
+//	println!("{}", layout);
+//	println!("======");
 	let mut mode = SkipWhitespace;
 	let mut width = 0usize;
 	let mut running_width = 0usize;
@@ -476,11 +454,11 @@ fn beautify_input(layout: &str) -> (usize, usize, Vec<char>) {
 		panic!("Ah, shit... expected: {}, got: {}", expected, chars.len());
 	}
 
-	println!("======");
-	println!("Width: {}", width);
-	println!("Height: {}", height);
-	println!("{:?}", chars);
-	println!("======");
+//	println!("======");
+//	println!("Width: {}", width);
+//	println!("Height: {}", height);
+//	println!("{:?}", chars);
+//	println!("======");
 
 	(width, height, chars)
 }
