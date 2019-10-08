@@ -3,13 +3,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use structopt::StructOpt;
-use tmux_interface::{
-	AttachSession,
-	NewSession,
-	NewWindow,
-	SplitWindow,
-	TmuxInterface
-};
+use tmux_interface::{AttachSession, NewSession, NewWindow, SelectWindow, SendKeys, SplitWindow, TmuxInterface};
 
 const ORIGINAL_WINDOW_NAME: &str = "__DEFAULT__";
 
@@ -20,11 +14,13 @@ struct Setup {
 	session: Option<Session>,
 	#[serde(rename = "window")]
 	windows: Vec<Window>,
+	rebuild: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct Session {
 	name: Option<String>,
+	select: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,15 +43,32 @@ struct Args {
 	/// TOML file that contains a txl layout.
 	#[structopt(parse(from_os_str))]
 	file: PathBuf,
+
+	/// If true, txl will destroy the previous session if it exists, and rebuild everything.
+	#[structopt(long)]
+	rebuild: bool,
+}
+
+
+macro_rules! handle {
+	($expr:expr, |$err:ident| $err_handler:expr) => {{
+		match $expr {
+			Ok(v) => v,
+			Err($err) => {
+				$err_handler
+			}
+		}
+	}};
 }
 
 fn main() {
 	let Args {
-		file,
+		file: path,
+		rebuild,
 	} = <_>::from_args();
 
-	let input = {
-		let mut path = file;
+	let (path, input) = {
+		let mut path = path;
 
 		macro_rules! not {
 		    ($ext:literal) => {{
@@ -71,7 +84,7 @@ fn main() {
 		}
 
 		match std::fs::read_to_string(&path) {
-			Ok(value) => value,
+			Ok(value) => (path, value),
 			Err(err) => {
 				eprintln!("Unable to read file: {}\n{}", path.display(), err);
 				return;
@@ -83,17 +96,25 @@ fn main() {
 		file,
 		socket_name,
 		session,
-		windows
-	} = toml::from_str(&input).unwrap();
+		windows,
+		rebuild: rebuilding,
+	} = handle!(toml::from_str(&input), |err| {
+		eprintln!("Input file (\"{}\") contains invalid toml: {}", path.display(), err);
+		return;
+	});
+
+	let rebuild = rebuild || rebuilding.unwrap_or(false);
 
 	let file = file.as_ref().map(Deref::deref);
 	let socket_name = socket_name.as_ref().map(Deref::deref);
 
 	let Session {
 		name: session_name,
+		select,
 	} = session.unwrap_or_default();
 
 	let session_name = session_name.as_ref().map(Deref::deref);
+	let select = select.as_ref().map(Deref::deref);
 
 //	println!("{:#?}", windows);
 
@@ -104,31 +125,74 @@ fn main() {
 	};
 
 	{ // Setting up the session and whatnot.
-		let has_session = tmux.has_session(session_name).unwrap();
+		let has_session = handle!(tmux.has_session(session_name), |err| {
+			eprintln!("Unable to check if session already exists: {}", err);
+			return;
+		});
 
 		if has_session {
+			if !rebuild {
+				// Well, we're not allowed to rebuild, so attach ourselves, and we're done.
+				attach_to(&tmux, session_name);
+			}
+
 			println!("Found session... Destroying..");
-			tmux.kill_session(Some(false), None, session_name).unwrap();
+			handle!(tmux.kill_session(Some(false), None, session_name), |err| {
+				eprintln!("Unable to kill session with the same name: {}", err);
+				return;
+			});
 		}
 
-		let has_session = tmux.has_session(session_name).unwrap();
+		let has_session = handle!(tmux.has_session(session_name), |err| {
+			eprintln!("Unable to check if session already exists: {}", err);
+			return;
+		});
 		if has_session {
-			tmux.kill_server().unwrap();
+			// I've had some weird sessions where they just keep on sticking around.
+			// Stupidest solution I've found is to just kill the server... :|
+			handle!(tmux.kill_server(), |err| {
+				eprintln!("Unable to kill server: {}", err);
+				return;
+			});
 		}
+
+		let (width, height) = if let Some((w, h)) = term_size::dimensions() {
+			(Some(w), Some(h))
+		} else {
+			(None, None)
+		};
 
 		let new_session = NewSession {
 			session_name,
 			detached: Some(true),
+			width,
+			height,
 			..Default::default()
 		};
 
-		let output = tmux.new_session(&new_session).unwrap();
-		println!("new-session: {:?}", output);
+		match tmux.new_session(&new_session) {
+			Ok(v) => if !v.is_empty() {
+				eprintln!("Unable to create new session: {}", v);
+				return;
+			}
+			Err(err) => {
+				eprintln!("Unable to create new session: {}", err);
+				return;
+			}
+		}
 	}
 
 	// We rename the first window, so we can locate and remove it later.
-	let output = tmux.rename_window(None, ORIGINAL_WINDOW_NAME).unwrap();
-	println!("Renaming default window: {:?}", output);
+	match tmux.rename_window(None, ORIGINAL_WINDOW_NAME) {
+		Ok(v) => if !v.status.success() {
+			eprintln!("Unable to rename default window: {:?}", v);
+			return;
+		}
+		Err(err) => {
+			eprintln!("Unable to rename default window: {}", err);
+			return;
+		}
+	}
 
 	// This is where we need to build the actual layout...
 
@@ -146,15 +210,19 @@ fn main() {
 				window_name,
 				..Default::default()
 			};
-			let output = tmux.new_window(new_window).unwrap();
-			println!("new-window: {:?}", output);
+			match tmux.new_window(new_window) {
+				Ok(v) => if !v.is_empty() {
+					eprintln!("Unable to create new window: {}", v);
+					return;
+				}
+				Err(err) => {
+					eprintln!("Unable to create new window: {}", err);
+					return;
+				}
+			}
 		}
 
-		for action in parse_layout(&layout) {
-			println!("{:?}", action);
-
-			let Action(direction, target, percentage) = action;
-
+		for Action(direction, target, percentage) in parse_layout(&layout) {
 			let selected = format!("{}", target + 1);
 			let percentage = (percentage * 100f32) as usize;
 
@@ -166,40 +234,116 @@ fn main() {
 				..Default::default()
 			};
 
-			let output = tmux.split_window(&split_window).unwrap();
-			println!("split-window: {:?}", output);
+			match tmux.split_window(&split_window) {
+				Ok(v) => if !v.is_empty() {
+					eprintln!("Unable to split window: {}", v);
+					return;
+				}
+				Err(err) => {
+					eprintln!("Unable to split window: {}", err);
+					return;
+				}
+			}
 		}
 
-		for _pane in panes {
-			// Select pane, then send-keys.
+		let mut target = 1;
+		for pane in panes {
+			let target = {
+				let old = target;
+				target += 1;
+				old
+			};
 
-			// @TODO Jezza - 03 Oct. 2019: Finish this on Friday,
-			// when I have energy, and a linux system to test it on.
+			let command = if let Some(ref value) = pane.command {
+				value.deref()
+			} else {
+				continue;
+			};
+
+			let selected = format!("{}", target);
+			let keys = vec![
+				command,
+				"C-m"
+			];
+
+			let send_keys = SendKeys {
+				target_pane: Some(&selected),
+				key: keys,
+				..Default::default()
+			};
+
+			match tmux.send_keys(&send_keys) {
+				Ok(v) => if !v.status.success() {
+					eprintln!("Unable to send command ({}) to pane {}: {:?}", command, target, v);
+				}
+				Err(err) => {
+					eprintln!("Unable to send command ({}) to pane {}: {}", command, target, err);
+				}
+			}
 		}
 	}
 
 	// Kill the first window, as tmux just adds it, but we don't want or need it.
-	let output = tmux.kill_window(None, Some(ORIGINAL_WINDOW_NAME)).unwrap();
-	println!("Killing default window: {:?}", output);
+	match tmux.kill_window(None, Some(ORIGINAL_WINDOW_NAME)) {
+		Ok(v) => if !v.status.success() {
+			eprintln!("Unable to kill default window: {:?}", v);
+			return;
+		}
+		Err(err) => {
+			eprintln!("Unable to kill default window: {}", err);
+			return;
+		}
+	}
 
-	{ // We're done here, so we can attach to the session, and promptly fuck off.
-		let attach_session = AttachSession {
-			target_session: session_name,
-			detach_other: Some(true),
+	if let Some(value) = select {
+		let select_window = SelectWindow {
+			target_window: Some(value),
 			..Default::default()
 		};
 
-		println!("Attaching to session!");
-		tmux.attach_session_with(&attach_session, |args| {
-			println!("{:?}", args);
-
-//			use exec::Command;
-//			let mut command = Command::new("tmux");
-//			command.args(&args);
-//			let error = command.exec();
-//			panic!("{}", error);
-		});
+		match tmux.select_window(&select_window) {
+			Ok(v) => if !v.status.success() {
+				eprintln!("Unable to select window: {:?}", v);
+				return;
+			}
+			Err(err) => {
+				eprintln!("Unable to select window: {}", err);
+				return;
+			}
+		}
 	}
+
+	// We're done here, so we can attach to the session, and promptly fuck off.
+	attach_to(&tmux, session_name);
+}
+
+fn attach_to(tmux: &TmuxInterface, session_name: Option<&str>) -> ! {
+	let attach_session = AttachSession {
+		target_session: session_name,
+		detach_other: Some(true),
+		..Default::default()
+	};
+
+	tmux.attach_session_with(&attach_session, |args| {
+		println!("{:?}", args);
+
+		#[cfg(any(unix, macos))]
+			{
+				let program = tmux.tmux.unwrap_or("tmux");
+
+				use exec::Command;
+				let mut command = Command::new(program);
+				command.args(&args);
+				let error = command.exec();
+				panic!("{}", error);
+			}
+		#[cfg(not(any(unix, macos)))]
+			{
+				compile_error!("Windows doesn't support 'execvp'");
+			}
+	});
+
+	panic!("Failed to attach to tmux session: {:?}", session_name);
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,25 +356,29 @@ enum Direction {
 struct Action(Direction, u8, f32);
 
 fn parse_layout(layout: &str) -> Vec<Action> {
-	let (width, height, mut rects) = determine_rectangles(layout);
+	let mut rects = determine_rectangles(layout);
 
 	let mut actions = vec![];
 
-	while let Some((parent, child, ordinal)) = find_first_pair(&rects) {
-		let merging = rects.remove(child);
-		let remaining = &mut rects[parent];
-		println!("{:?} <= {:?}", remaining.c, merging.c);
+	while let Some((parent_index, child_index, ordinal)) = find_first_pair(&rects) {
+		let child = rects.remove(child_index);
+		let parent = &mut rects[parent_index];
+//		println!("{:?} <= {:?}", parent.c, child.c);
 
 		match ordinal {
 			Ordinal::South => {
-				remaining.height += merging.height;
-				let percentage = merging.height as f32 / height as f32;
-				actions.push(Action(Direction::Vertical, parent as u8, percentage));
+				let old_height = child.height;
+				let new_height = parent.height + child.height;
+				let percentage = old_height as f32 / new_height as f32;
+				parent.height = new_height;
+				actions.push(Action(Direction::Vertical, parent_index as u8, percentage));
 			}
 			Ordinal::East => {
-				remaining.width += merging.width;
-				let percentage = merging.width as f32 / width as f32;
-				actions.push(Action(Direction::Horizontal, parent as u8, percentage));
+				let old_width = child.width;
+				let new_width = parent.width + child.width;
+				let percentage = old_width as f32 / new_width as f32;
+				parent.width = new_width;
+				actions.push(Action(Direction::Horizontal, parent_index as u8, percentage));
 			}
 			_ => panic!("Someone changed the ORDINALS constant..."),
 		}
@@ -247,11 +395,11 @@ fn find_first_pair(rects: &Vec<Rect>) -> Option<(usize, usize, Ordinal)> {
 		Ordinal::East,
 	];
 
-	for (left, rect) in rects.iter().enumerate() {
+	for (left_index, rect) in rects.iter().enumerate() {
 		for ordinal in ORDINALS {
-			let edge = rect.edge(*ordinal);
-			if let Some(right) = rects.iter().position(|r| r != rect && r.edge(ordinal.opposite()) == edge) {
-				return Some((left, right, *ordinal));
+			let left_edge = rect.edge(*ordinal);
+			if let Some(right_index) = rects.iter().position(|r| r != rect && r.edge(ordinal.opposite()) == left_edge) {
+				return Some((left_index, right_index, *ordinal));
 			}
 		}
 	}
@@ -329,23 +477,20 @@ struct Edge {
 	length: u8,
 }
 
-fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
-	let (width, height, chars) = process_input(layout);
+fn determine_rectangles(layout: &str) -> Vec<Rect> {
+	let (width, height, chars) = sanitise_input(layout);
 
 	macro_rules! point {
-	    ($index:ident) => {
-			{
-				let x = $index % width;
-				let y = $index / width;
-				(x, y)
-			}
-	    };
+	    ($index:ident) => {{
+			let x = $index % width;
+			let y = $index / width;
+			(x, y)
+		}};
 	}
 
 	let mut index = 0usize;
-	let mut bit_mask = vec![false; chars.len()];
-
 	let mut rects = vec![];
+	let mut bit_mask = vec![false; chars.len()];
 
 	while index < chars.len() {
 		if bit_mask[index] {
@@ -392,33 +537,33 @@ fn determine_rectangles(layout: &str) -> (usize, usize, Vec<Rect>) {
 
 		let (x, y) = point!(index);
 
-		let rect = Rect {
+		rects.push(Rect {
 			c,
 			x: x as u8,
 			y: y as u8,
 			width: rect_width as u8,
 			height: rect_height as u8,
-		};
-		rects.push(rect);
+		});
 
 		index += 1;
 	}
 
-	(width, height, rects)
+	rects
 }
 
-fn process_input(layout: &str) -> (usize, usize, Vec<char>) {
+fn sanitise_input(layout: &str) -> (usize, usize, Vec<char>) {
 	#[derive(PartialEq)]
 	enum Mode {
+		SkipWhitespace,
 		WidthCounting,
 		HeightCounting,
-		SkipWhitespace,
 	}
 	use Mode::*;
 
-//	println!("======");
-//	println!("{}", layout);
-//	println!("======");
+	// It basically treats any whitespace as newlines...
+	// If you give it something like "000\n000 000"
+	// It'll think you've given it a 3x3 of '0'
+
 	let mut mode = SkipWhitespace;
 	let mut width = 0usize;
 	let mut running_width = 0usize;
@@ -432,7 +577,7 @@ fn process_input(layout: &str) -> (usize, usize, Vec<char>) {
 					running_width = 0;
 				} else {
 					if width != running_width {
-						panic!("Unexpected character: {:?} @ pos:{}", chars.last().unwrap(), chars.len());
+						panic!("Width's do not match! (pos:{})", chars.len());
 					}
 					running_width = 0;
 				}
@@ -454,14 +599,8 @@ fn process_input(layout: &str) -> (usize, usize, Vec<char>) {
 	}
 	let expected = (width * height) as usize;
 	if expected != chars.len() {
-		panic!("Ah, shit... expected: {}, got: {}", expected, chars.len());
+		panic!("Unexpected character count. [expected: {}, got: {}]", expected, chars.len());
 	}
-
-//	println!("======");
-//	println!("Width: {}", width);
-//	println!("Height: {}", height);
-//	println!("{:?}", chars);
-//	println!("======");
 
 	(width, height, chars)
 }

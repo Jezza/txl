@@ -1,0 +1,32 @@
+#file = "/home/amazon/.config/tmux/jezza.conf"
+socket_name = "jezza"
+
+[session]
+name = "Example"
+select = "First!"
+
+[[window]]
+name = "First!"
+layout = '''
+1112
+1112
+3333
+'''
+
+[[window.pane]]
+command = '''
+cd /home/jezza
+reset
+'''
+
+[[window.pane]]
+command = '''
+cd /home/jezza/Misc/Rust
+reset
+'''
+
+[[window.pane]]
+command = '''
+cd /home/jezza/Projects/sales.services.marketplace/target/logs
+less -f
+'''
